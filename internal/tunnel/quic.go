@@ -99,7 +99,11 @@ func (t *QUICTunnel) authenticate() error {
 }
 
 func (t *QUICTunnel) heartbeat() {
-	ticker := time.NewTicker(time.Duration(t.cfg.Keepalive) * time.Second)
+	interval := t.cfg.Keepalive
+	if interval <= 0 {
+		interval = 15 // 默认 15 秒
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
 	for {
