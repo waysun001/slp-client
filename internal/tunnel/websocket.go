@@ -1,7 +1,7 @@
 package tunnel
 
 import (
-	"crypto/tls"
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	tls "github.com/refraction-networking/utls"
 	"github.com/smartlink/slp-client/internal/config"
 	"github.com/smartlink/slp-client/internal/protocol"
 )
@@ -29,14 +30,41 @@ func NewWebSocketTunnel(cfg *config.TunnelConfig) *WebSocketTunnel {
 }
 
 func (t *WebSocketTunnel) Connect() error {
-	// WebSocket 模式下，每次 Proxy 创建新连接，这里只标记为已连接
 	t.connected = true
 	log.Printf("[%s] WebSocket tunnel ready (connect on demand)", t.cfg.Name)
 	return nil
 }
 
+// dialTLSWithFingerprint 使用 Chrome 指纹建立 TLS 连接
+func (t *WebSocketTunnel) dialTLSWithFingerprint(ctx context.Context, network, addr string) (net.Conn, error) {
+	// 先建立 TCP 连接
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 提取主机名
+	host, _, _ := net.SplitHostPort(addr)
+	if host == "" {
+		host = addr
+	}
+
+	// 使用 utls 建立 TLS 连接，模拟 Chrome 指纹
+	tlsConn := tls.UClient(conn, &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: t.cfg.Insecure,
+	}, tls.HelloChrome_Auto) // 自动选择最新 Chrome 指纹
+
+	if err := tlsConn.Handshake(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return tlsConn, nil
+}
+
 func (t *WebSocketTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uint16) error {
-	// 每次代理请求创建新的 WebSocket 连接
 	scheme := "wss"
 	path := t.cfg.WSPath
 	if path == "" {
@@ -49,14 +77,13 @@ func (t *WebSocketTunnel) Proxy(localConn net.Conn, targetAddr string, targetPor
 		Path:   path,
 	}
 
+	// 使用自定义 TLS 拨号器（Chrome 指纹）
 	dialer := websocket.Dialer{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: t.cfg.Insecure,
-		},
-		HandshakeTimeout: 10 * time.Second,
+		NetDialTLSContext:  t.dialTLSWithFingerprint,
+		HandshakeTimeout:   10 * time.Second,
 	}
 
-	log.Printf("[%s] WS connecting to %s for %s:%d", t.cfg.Name, u.String(), targetAddr, targetPort)
+	log.Printf("[%s] WS connecting to %s (Chrome fingerprint)", t.cfg.Name, u.String())
 
 	conn, _, err := dialer.Dial(u.String(), nil)
 	if err != nil {

@@ -54,9 +54,8 @@ func ReadAuthResponse(r io.Reader) (bool, error) {
 	return resp[1] == 0x01, nil
 }
 
-// WriteConnectFrame 写入连接请求帧（目标地址）
+// WriteConnectFrame 写入连接请求帧
 func WriteConnectFrame(w io.Writer, addr string, port uint16) error {
-	// 解析地址类型
 	var addrType byte
 	var addrBytes []byte
 
@@ -73,7 +72,6 @@ func WriteConnectFrame(w io.Writer, addr string, port uint16) error {
 		addrBytes = []byte(addr)
 	}
 
-	// 构建帧: Type(1) + AddrType(1) + AddrLen(1) + Addr(n) + Port(2)
 	frame := make([]byte, 3+len(addrBytes)+2)
 	frame[0] = FrameTCP
 	frame[1] = addrType
