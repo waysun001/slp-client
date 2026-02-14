@@ -1,0 +1,24 @@
+log_level: info
+
+tunnels:
+  - name: "us-server"
+    enabled: true
+    server: "1.2.3.4"
+    port: 443
+    transport: "quic"
+    token: "your-token-here"
+    local_port: 1080
+    insecure: true        # 自签名证书需要开启
+    keepalive: 15
+    pool_size: 2
+
+  # 多隧道示例
+  # - name: "jp-server"
+  #   enabled: true
+  #   server: "5.6.7.8"
+  #   port: 443
+  #   transport: "websocket"
+  #   ws_path: "/ws"
+  #   token: "another-token"
+  #   local_port: 1081
+  #   insecure: true

@@ -1,0 +1,7 @@
+slp-client
+slp-client-*
+*.exe
+.idea/
+.vscode/
+*.swp
+*.log
