@@ -148,14 +148,11 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// 响应格式: VER(1) + REP(1) + RSV(1) + ATYP(1) + BND.ADDR(4) + BND.PORT(2)
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// 6. 通过隧道代理（这个函数会接管 conn 的生命周期）
+	// 6. 通过隧道代理（阻塞直到完成）
 	if err := s.handler.Proxy(conn, targetAddr, targetPort); err != nil {
 		log.Printf("Proxy error: %v", err)
-		conn.Close()
-		return
 	}
-	
-	// conn 已被 Proxy 接管，不要关闭
+	// Proxy 完成后连接自动关闭
 }
 
 // Addr 返回监听地址

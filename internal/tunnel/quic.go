@@ -158,29 +158,25 @@ func (t *QUICTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uin
 
 	log.Printf("[%s] Proxying to %s:%d", t.cfg.Name, targetAddr, targetPort)
 
-	// 双向转发
+	// 双向转发（在当前 goroutine 中阻塞执行）
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// local -> remote
 	go func() {
-		defer stream.Close()
-		defer localConn.Close()
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// local -> remote
-		go func() {
-			defer wg.Done()
-			io.Copy(stream, localConn)
-		}()
-
-		// remote -> local
-		go func() {
-			defer wg.Done()
-			io.Copy(localConn, stream)
-		}()
-
-		wg.Wait()
+		defer wg.Done()
+		io.Copy(stream, localConn)
+		stream.Close() // 关闭写方向
 	}()
 
+	// remote -> local
+	go func() {
+		defer wg.Done()
+		io.Copy(localConn, stream)
+		localConn.Close() // 关闭写方向
+	}()
+
+	wg.Wait()
 	return nil
 }
 
