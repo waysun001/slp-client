@@ -1,5 +1,5 @@
-slp-client
-slp-client-*
+/slp-client
+/slp-client-*
 *.exe
 .idea/
 .vscode/
