@@ -3,7 +3,6 @@ package tunnel
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/url"
