@@ -94,7 +94,11 @@ func (t *KCPTunnel) authenticate() error {
 }
 
 func (t *KCPTunnel) heartbeat() {
-	ticker := time.NewTicker(time.Duration(t.cfg.Keepalive) * time.Second)
+	interval := t.cfg.Keepalive
+	if interval <= 0 {
+		interval = 15
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
 	for {
