@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strconv"
 	"sync"
 )
 
@@ -77,17 +76,19 @@ func (s *Server) accept() {
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
-	defer conn.Close()
+	// 不要在这里 defer conn.Close()，让 Proxy 接管
 
 	// SOCKS5 握手
 	// 1. 读取版本和认证方法
 	buf := make([]byte, 256)
 	n, err := conn.Read(buf)
 	if err != nil || n < 2 {
+		conn.Close()
 		return
 	}
 
 	if buf[0] != 0x05 {
+		conn.Close()
 		return // 不是 SOCKS5
 	}
 
@@ -97,84 +98,69 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// 3. 读取请求
 	n, err = conn.Read(buf)
 	if err != nil || n < 7 {
+		conn.Close()
 		return
 	}
 
 	if buf[0] != 0x05 || buf[1] != 0x01 {
 		// 只支持 CONNECT 命令
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		conn.Close()
 		return
 	}
 
 	// 4. 解析目标地址
 	var targetAddr string
 	var targetPort uint16
-	var addrEnd int
 
 	switch buf[3] {
 	case 0x01: // IPv4
 		if n < 10 {
+			conn.Close()
 			return
 		}
 		targetAddr = net.IP(buf[4:8]).String()
 		targetPort = uint16(buf[8])<<8 | uint16(buf[9])
-		addrEnd = 10
 	case 0x03: // 域名
 		addrLen := int(buf[4])
 		if n < 5+addrLen+2 {
+			conn.Close()
 			return
 		}
 		targetAddr = string(buf[5 : 5+addrLen])
 		targetPort = uint16(buf[5+addrLen])<<8 | uint16(buf[5+addrLen+1])
-		addrEnd = 5 + addrLen + 2
 	case 0x04: // IPv6
 		if n < 22 {
+			conn.Close()
 			return
 		}
 		targetAddr = net.IP(buf[4:20]).String()
 		targetPort = uint16(buf[20])<<8 | uint16(buf[21])
-		addrEnd = 22
 	default:
 		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		conn.Close()
 		return
 	}
-
-	_ = addrEnd // 避免未使用警告
 
 	log.Printf("SOCKS5 request: %s:%d", targetAddr, targetPort)
 
-	// 5. 通过隧道代理
-	if err := s.handler.Proxy(conn, targetAddr, targetPort); err != nil {
-		log.Printf("Proxy error: %v", err)
-		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	// 6. 响应成功
-	// 返回绑定地址（这里用 0.0.0.0:0）
+	// 5. 先发送成功响应，再开始代理
+	// 响应格式: VER(1) + REP(1) + RSV(1) + ATYP(1) + BND.ADDR(4) + BND.PORT(2)
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// 连接已被 handler.Proxy 接管，等待完成
-	// 由于 Proxy 是异步的，这里需要等待
-	select {}
+	// 6. 通过隧道代理（这个函数会接管 conn 的生命周期）
+	if err := s.handler.Proxy(conn, targetAddr, targetPort); err != nil {
+		log.Printf("Proxy error: %v", err)
+		conn.Close()
+		return
+	}
+	
+	// conn 已被 Proxy 接管，不要关闭
 }
 
 // Addr 返回监听地址
 func (s *Server) Addr() string {
 	return s.addr
-}
-
-// ParseAddr 解析 host:port
-func ParseAddr(addr string) (string, uint16, error) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", 0, err
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return "", 0, err
-	}
-	return host, uint16(port), nil
 }
 
 var _ io.Closer = (*Server)(nil)
