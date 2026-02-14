@@ -28,6 +28,10 @@ func main() {
 	localPort := flag.Int("l", 1080, "local SOCKS5 port")
 	insecure := flag.Bool("insecure", false, "skip TLS verification (for self-signed certs)")
 	
+	// 混淆选项
+	obfs := flag.Bool("obfs", false, "enable obfuscation")
+	obfsKey := flag.String("obfs-key", "", "obfuscation key (default: use token)")
+	
 	flag.Parse()
 
 	if *showVersion {
@@ -50,6 +54,8 @@ func main() {
 					Token:      *token,
 					LocalPort:  *localPort,
 					Insecure:   *insecure,
+					Obfs:       *obfs,
+					ObfsKey:    *obfsKey,
 				},
 			},
 		}

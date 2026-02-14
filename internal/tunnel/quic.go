@@ -12,6 +12,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/smartlink/slp-client/internal/config"
+	"github.com/smartlink/slp-client/internal/obfs"
 	"github.com/smartlink/slp-client/internal/protocol"
 )
 
@@ -47,12 +48,47 @@ func (t *QUICTunnel) Connect() error {
 		KeepAlivePeriod: time.Duration(t.cfg.Keepalive) * time.Second,
 	}
 
-	log.Printf("[%s] Connecting to %s (QUIC)...", t.cfg.Name, addr)
+	var conn quic.Connection
+	var err error
 
-	conn, err := quic.DialAddr(t.ctx, addr, tlsConfig, quicConfig)
-	if err != nil {
-		return fmt.Errorf("failed to connect: %w", err)
+	if t.cfg.Obfs {
+		// 使用混淆连接
+		obfsKey := t.cfg.ObfsKey
+		if obfsKey == "" {
+			obfsKey = t.cfg.Token // 默认用 token 作为混淆密钥
+		}
+		
+		log.Printf("[%s] Connecting to %s (QUIC + Obfs)...", t.cfg.Name, addr)
+		
+		// 创建 UDP 连接
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return fmt.Errorf("failed to resolve addr: %w", err)
+		}
+		
+		udpConn, err := net.ListenUDP("udp", nil)
+		if err != nil {
+			return fmt.Errorf("failed to create UDP conn: %w", err)
+		}
+		
+		// 包装为混淆连接
+		obfsConn := obfs.NewObfsPacketConn(udpConn, obfsKey)
+		
+		// 使用混淆连接建立 QUIC
+		tr := &quic.Transport{Conn: obfsConn}
+		conn, err = tr.Dial(t.ctx, udpAddr, tlsConfig, quicConfig)
+		if err != nil {
+			udpConn.Close()
+			return fmt.Errorf("failed to connect: %w", err)
+		}
+	} else {
+		log.Printf("[%s] Connecting to %s (QUIC)...", t.cfg.Name, addr)
+		conn, err = quic.DialAddr(t.ctx, addr, tlsConfig, quicConfig)
+		if err != nil {
+			return fmt.Errorf("failed to connect: %w", err)
+		}
 	}
+	
 	t.conn = conn
 
 	// 认证
@@ -79,29 +115,30 @@ func (t *QUICTunnel) authenticate() error {
 	// 发送认证帧
 	if err := protocol.WriteAuthFrame(stream, t.cfg.Token); err != nil {
 		stream.Close()
-		return fmt.Errorf("failed to write auth: %w", err)
+		return fmt.Errorf("failed to write auth frame: %w", err)
 	}
 
 	// 读取响应
+	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	success, err := protocol.ReadAuthResponse(stream)
 	if err != nil {
 		stream.Close()
 		return fmt.Errorf("failed to read auth response: %w", err)
 	}
 
-	stream.Close()
-
 	if !success {
+		stream.Close()
 		return protocol.ErrAuthFailed
 	}
 
+	t.authStream = stream
 	return nil
 }
 
 func (t *QUICTunnel) heartbeat() {
 	interval := t.cfg.Keepalive
 	if interval <= 0 {
-		interval = 15 // 默认 15 秒
+		interval = 15
 	}
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
@@ -113,7 +150,6 @@ func (t *QUICTunnel) heartbeat() {
 		case <-ticker.C:
 			if err := t.sendHeartbeat(); err != nil {
 				log.Printf("[%s] Heartbeat failed: %v", t.cfg.Name, err)
-				// TODO: 触发重连
 			}
 		}
 	}
@@ -183,7 +219,7 @@ func (t *QUICTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uin
 func (t *QUICTunnel) Close() {
 	t.cancel()
 	if t.conn != nil {
-		t.conn.CloseWithError(0, "client shutdown")
+		t.conn.CloseWithError(0, "client closed")
 	}
 }
 
@@ -192,3 +228,5 @@ func (t *QUICTunnel) IsConnected() bool {
 	defer t.mu.Unlock()
 	return t.connected
 }
+
+var _ Tunnel = (*QUICTunnel)(nil)

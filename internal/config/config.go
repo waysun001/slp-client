@@ -21,6 +21,10 @@ type TunnelConfig struct {
 	LocalPort int    `yaml:"local_port"` // 本地 SOCKS5 端口
 	Insecure  bool   `yaml:"insecure"`   // 跳过 TLS 验证
 	
+	// 混淆
+	Obfs     bool   `yaml:"obfs"`      // 启用混淆
+	ObfsKey  string `yaml:"obfs_key"`  // 混淆密钥（默认用 token）
+	
 	// WebSocket 专用
 	WSPath string `yaml:"ws_path"`
 	
