@@ -1,5 +1,5 @@
 # SLP Client
-V1.01
+V1.01.08
 SmartLink Protocol 客户端 - 支持 Linux 服务器测试和 OpenWrt 路由器
 
 ## 编译
