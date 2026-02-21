@@ -1,14 +1,12 @@
 #!/bin/bash
 #
 # SLP Client 一键安装脚本
-# 从预编译二进制安装，不依赖 Go/Git
+# 将同目录下的预编译二进制安装到系统
 #
 
 set -e
 
-# ========== 下载地址（部署前替换为实际服务器地址） ==========
-DOWNLOAD_BASE_URL="https://your-server.com/slp"
-# ===========================================================
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -25,26 +23,23 @@ case $ARCH in
     *)       log_error "不支持的架构: $ARCH" ;;
 esac
 
-# 下载预编译二进制
-download_binary() {
-    local url="${DOWNLOAD_BASE_URL}/slp-client-linux-${ARCH}"
+# 安装二进制（使用同目录下的文件）
+install_binary() {
     local target="/usr/local/bin/slp-client"
+    local local_bin="${SCRIPT_DIR}/slp-client-linux-${ARCH}"
 
-    log_info "下载二进制: ${url}"
-
-    if command -v curl &> /dev/null; then
-        curl -fSL --progress-bar -o "${target}" "${url}" || log_error "下载失败: ${url}"
-    elif command -v wget &> /dev/null; then
-        wget -q --show-progress -O "${target}" "${url}" || log_error "下载失败: ${url}"
+    if [[ -f "$local_bin" ]]; then
+        log_info "使用本地二进制: ${local_bin}"
+        cp "$local_bin" "$target"
     else
-        log_error "需要 curl 或 wget，请先安装"
+        log_error "未找到二进制文件: ${local_bin}\n请将 slp-client-linux-${ARCH} 放在 install.sh 同目录下"
     fi
 
     chmod +x "${target}"
     log_info "已安装: ${target}"
 }
 
-download_binary
+install_binary
 
 log_info "安装完成！"
 echo ""
