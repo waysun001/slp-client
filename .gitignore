@@ -1,6 +1,7 @@
 /slp-client
 /slp-client-*
 *.exe
+release/
 .idea/
 .vscode/
 *.swp

@@ -1,0 +1,50 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build all targets
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          BUILD_TIME=$(date +%Y%m%d%H%M%S)
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}"
+          mkdir -p release
+
+          # amd64 + arm64
+          for arch in amd64 arm64; do
+            echo "==> Building linux/${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH=${arch} \
+              go build -ldflags "${LDFLAGS}" \
+              -o release/slp-client-linux-${arch} ./cmd/slp-client/
+          done
+
+          # mipsle softfloat (OpenWrt MIPS 路由器)
+          echo "==> Building linux/mipsle (softfloat)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
+            go build -ldflags "${LDFLAGS}" \
+            -o release/slp-client-linux-mipsle ./cmd/slp-client/
+
+          # mips softfloat
+          echo "==> Building linux/mips (softfloat)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=mips GOMIPS=softfloat \
+            go build -ldflags "${LDFLAGS}" \
+            -o release/slp-client-linux-mips ./cmd/slp-client/
+
+          ls -lh release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
