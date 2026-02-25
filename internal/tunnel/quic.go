@@ -16,6 +16,22 @@ import (
 	"github.com/smartlink/slp-client/internal/protocol"
 )
 
+// copyBufPool 64KB 池化缓冲区，减少 io.Copy 系统调用开销
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
+
+func getCopyBuf() []byte {
+	return *(copyBufPool.Get().(*[]byte))
+}
+
+func putCopyBuf(buf []byte) {
+	copyBufPool.Put(&buf)
+}
+
 // idleTimeoutReader wraps a reader with deadline-based idle timeout.
 // On each Read call, it resets the read deadline so that idle streams
 // are automatically closed after the timeout period.
@@ -75,9 +91,15 @@ func (t *QUICTunnel) connectInternal() error {
 	}
 
 	quicConfig := &quic.Config{
-		MaxIdleTimeout:       30 * time.Second,
-		KeepAlivePeriod:      time.Duration(t.cfg.Keepalive) * time.Second,
-		HandshakeIdleTimeout: 15 * time.Second,
+		MaxIdleTimeout:                 2 * time.Minute,
+		KeepAlivePeriod:                time.Duration(t.cfg.Keepalive) * time.Second,
+		HandshakeIdleTimeout:           15 * time.Second,
+		MaxIncomingStreams:              1024,
+		MaxIncomingUniStreams:           1024,
+		InitialStreamReceiveWindow:     4 * 1024 * 1024,  // 4MB（默认 512KB）
+		MaxStreamReceiveWindow:         16 * 1024 * 1024,  // 16MB（默认 6MB）
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,  // 16MB（默认 768KB）
+		MaxConnectionReceiveWindow:     64 * 1024 * 1024,  // 64MB（默认 15MB）
 	}
 
 	var conn quic.Connection
@@ -284,7 +306,9 @@ func (t *QUICTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uin
 			setDeadline: localConn.SetReadDeadline,
 			timeout:     idleTimeout,
 		}
-		io.Copy(stream, r)
+		buf := getCopyBuf()
+		io.CopyBuffer(stream, r, buf)
+		putCopyBuf(buf)
 		stream.Close()
 	}()
 
@@ -296,7 +320,9 @@ func (t *QUICTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uin
 			setDeadline: stream.SetReadDeadline,
 			timeout:     idleTimeout,
 		}
-		io.Copy(localConn, r)
+		buf := getCopyBuf()
+		io.CopyBuffer(localConn, r, buf)
+		putCopyBuf(buf)
 		localConn.Close()
 	}()
 
