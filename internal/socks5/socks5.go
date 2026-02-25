@@ -8,11 +8,17 @@ import (
 	"sync"
 )
 
+// HostnameResolver IP → hostname 反查接口（redir-host 模式）
+type HostnameResolver interface {
+	Lookup(ip string) (hostname string, ok bool)
+}
+
 // Server SOCKS5 服务器
 type Server struct {
 	addr     string
 	listener net.Listener
 	handler  ProxyHandler
+	resolver HostnameResolver
 	done     chan struct{}
 	wg       sync.WaitGroup
 }
@@ -29,6 +35,11 @@ func New(port int, handler ProxyHandler) *Server {
 		handler: handler,
 		done:    make(chan struct{}),
 	}
+}
+
+// SetResolver 设置 IP→hostname 反查器（启用 redir-host 模式）
+func (s *Server) SetResolver(resolver HostnameResolver) {
+	s.resolver = resolver
 }
 
 // Start 启动服务器
@@ -121,6 +132,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		targetAddr = net.IP(buf[4:8]).String()
 		targetPort = uint16(buf[8])<<8 | uint16(buf[9])
+
+		// Redir-host: 反查原始域名，用域名替换 IP 发送给服务端
+		if s.resolver != nil {
+			if hostname, ok := s.resolver.Lookup(targetAddr); ok {
+				log.Printf("SOCKS5 redir-host: %s → %s", targetAddr, hostname)
+				targetAddr = hostname
+			}
+		}
 	case 0x03: // 域名
 		addrLen := int(buf[4])
 		if n < 5+addrLen+2 {

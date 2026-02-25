@@ -10,6 +10,7 @@ import (
 type Tunnel interface {
 	Connect() error
 	Proxy(localConn net.Conn, targetAddr string, targetPort uint16) error
+	ForwardDNS(query []byte) ([]byte, error) // DNS-over-TCP 转发
 	Close()
 	IsConnected() bool
 }

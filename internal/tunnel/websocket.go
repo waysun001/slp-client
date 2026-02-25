@@ -171,6 +171,11 @@ func (t *WebSocketTunnel) Proxy(localConn net.Conn, targetAddr string, targetPor
 	return nil
 }
 
+// ForwardDNS WebSocket 隧道不支持 DNS 转发（按需连接模式，无持久连接）
+func (t *WebSocketTunnel) ForwardDNS(query []byte) ([]byte, error) {
+	return nil, fmt.Errorf("ForwardDNS not supported on WebSocket")
+}
+
 func (t *WebSocketTunnel) Close() {
 	close(t.done)
 }

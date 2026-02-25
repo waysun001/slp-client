@@ -31,6 +31,9 @@ type TunnelConfig struct {
 	// KCP 专用
 	FEC int `yaml:"fec"` // FEC 冗余百分比
 	
+	// DNS 代理（redir-host 模式）
+	DNSPort int `yaml:"dns_port"` // DNS 代理端口（0 = 禁用）
+
 	// 高级选项
 	PoolSize  int `yaml:"pool_size"`  // 连接池大小
 	Keepalive int `yaml:"keepalive"`  // 心跳间隔（秒）

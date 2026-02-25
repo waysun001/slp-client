@@ -30,7 +30,22 @@ func NewKCPTunnel(cfg *config.TunnelConfig) *KCPTunnel {
 	}
 }
 
+// Connect establishes the KCP connection and starts the heartbeat goroutine.
+// This is the public entry point; heartbeat is started only here (not on reconnect).
 func (t *KCPTunnel) Connect() error {
+	if err := t.connectInternal(); err != nil {
+		return err
+	}
+
+	// Start heartbeat (only from Connect, reconnect reuses the same goroutine)
+	go t.heartbeat()
+
+	return nil
+}
+
+// connectInternal establishes connection and authenticates, without starting heartbeat.
+// Used by both Connect() (initial) and reconnect() (auto-recovery).
+func (t *KCPTunnel) connectInternal() error {
 	addr := fmt.Sprintf("%s:%d", t.cfg.Server, t.cfg.Port)
 
 	// 加密（与服务端一致）
@@ -46,9 +61,26 @@ func (t *KCPTunnel) Connect() error {
 
 	log.Printf("[%s] Connecting to %s (KCP)...", t.cfg.Name, addr)
 
-	conn, err := kcp.DialWithOptions(addr, newBlockCrypt(block), dataShards, parityShards)
-	if err != nil {
-		return fmt.Errorf("failed to connect: %w", err)
+	// KCP 库不支持 context，使用 goroutine + timer 实现超时
+	type dialResult struct {
+		conn *kcp.UDPSession
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		c, e := kcp.DialWithOptions(addr, newBlockCrypt(block), dataShards, parityShards)
+		ch <- dialResult{c, e}
+	}()
+
+	var conn *kcp.UDPSession
+	select {
+	case result := <-ch:
+		if result.err != nil {
+			return fmt.Errorf("failed to connect: %w", result.err)
+		}
+		conn = result.conn
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("KCP dial timeout after 30s")
 	}
 
 	// 设置 KCP 参数
@@ -59,7 +91,9 @@ func (t *KCPTunnel) Connect() error {
 	conn.SetMtu(1350)
 	conn.SetACKNoDelay(true)
 
+	t.mu.Lock()
 	t.conn = conn
+	t.mu.Unlock()
 
 	// 认证
 	if err := t.authenticate(); err != nil {
@@ -67,12 +101,11 @@ func (t *KCPTunnel) Connect() error {
 		return err
 	}
 
+	t.mu.Lock()
 	t.connected = true
+	t.mu.Unlock()
+
 	log.Printf("[%s] Connected and authenticated", t.cfg.Name)
-
-	// 启动心跳
-	go t.heartbeat()
-
 	return nil
 }
 
@@ -101,15 +134,66 @@ func (t *KCPTunnel) heartbeat() {
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
+	failCount := 0
+
 	for {
 		select {
 		case <-t.done:
 			return
 		case <-ticker.C:
 			t.mu.Lock()
-			protocol.WriteHeartbeat(t.conn)
+			err := protocol.WriteHeartbeat(t.conn)
 			t.mu.Unlock()
+
+			if err != nil {
+				failCount++
+				log.Printf("[%s] KCP heartbeat failed (%d/3): %v", t.cfg.Name, failCount, err)
+				if failCount >= 3 {
+					log.Printf("[%s] KCP heartbeat failed 3 consecutive times, reconnecting...", t.cfg.Name)
+					t.reconnect()
+					failCount = 0
+				}
+			} else {
+				failCount = 0
+			}
 		}
+	}
+}
+
+// reconnect performs auto-reconnect with exponential backoff.
+// Called from heartbeat goroutine, so no new goroutine is spawned.
+func (t *KCPTunnel) reconnect() {
+	t.mu.Lock()
+	t.connected = false
+	if t.conn != nil {
+		t.conn.Close()
+	}
+	t.mu.Unlock()
+
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-t.done:
+			return
+		default:
+		}
+
+		log.Printf("[%s] KCP reconnecting (backoff: %v)...", t.cfg.Name, backoff)
+		time.Sleep(backoff)
+
+		if err := t.connectInternal(); err != nil {
+			log.Printf("[%s] KCP reconnect failed: %v", t.cfg.Name, err)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		log.Printf("[%s] KCP reconnected successfully", t.cfg.Name)
+		return
 	}
 }
 
@@ -146,6 +230,11 @@ func (t *KCPTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uint
 	}()
 
 	return nil
+}
+
+// ForwardDNS KCP 隧道不支持 DNS 转发（单连接复用，不适合独立 stream）
+func (t *KCPTunnel) ForwardDNS(query []byte) ([]byte, error) {
+	return nil, fmt.Errorf("ForwardDNS not supported on KCP")
 }
 
 func (t *KCPTunnel) Close() {

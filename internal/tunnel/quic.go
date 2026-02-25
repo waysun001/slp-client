@@ -16,6 +16,22 @@ import (
 	"github.com/smartlink/slp-client/internal/protocol"
 )
 
+// idleTimeoutReader wraps a reader with deadline-based idle timeout.
+// On each Read call, it resets the read deadline so that idle streams
+// are automatically closed after the timeout period.
+type idleTimeoutReader struct {
+	reader      io.Reader
+	setDeadline func(time.Time) error
+	timeout     time.Duration
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	if err := r.setDeadline(time.Now().Add(r.timeout)); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
 type QUICTunnel struct {
 	cfg        *config.TunnelConfig
 	conn       quic.Connection
@@ -35,7 +51,22 @@ func NewQUICTunnel(cfg *config.TunnelConfig) *QUICTunnel {
 	}
 }
 
+// Connect establishes the QUIC connection and starts the heartbeat goroutine.
+// This is the public entry point; heartbeat is started only here (not on reconnect).
 func (t *QUICTunnel) Connect() error {
+	if err := t.connectInternal(); err != nil {
+		return err
+	}
+
+	// Start heartbeat (only from Connect, reconnect reuses the same goroutine)
+	go t.heartbeat()
+
+	return nil
+}
+
+// connectInternal establishes connection and authenticates, without starting heartbeat.
+// Used by both Connect() (initial) and reconnect() (auto-recovery).
+func (t *QUICTunnel) connectInternal() error {
 	addr := fmt.Sprintf("%s:%d", t.cfg.Server, t.cfg.Port)
 
 	tlsConfig := &tls.Config{
@@ -44,65 +75,67 @@ func (t *QUICTunnel) Connect() error {
 	}
 
 	quicConfig := &quic.Config{
-		MaxIdleTimeout:  30 * time.Second,
-		KeepAlivePeriod: time.Duration(t.cfg.Keepalive) * time.Second,
+		MaxIdleTimeout:       30 * time.Second,
+		KeepAlivePeriod:      time.Duration(t.cfg.Keepalive) * time.Second,
+		HandshakeIdleTimeout: 15 * time.Second,
 	}
 
 	var conn quic.Connection
 	var err error
 
+	// Dial context with 30s timeout to prevent infinite hang on weak networks
+	dialCtx, dialCancel := context.WithTimeout(t.ctx, 30*time.Second)
+	defer dialCancel()
+
 	if t.cfg.Obfs {
-		// 使用混淆连接
 		obfsKey := t.cfg.ObfsKey
 		if obfsKey == "" {
-			obfsKey = t.cfg.Token // 默认用 token 作为混淆密钥
+			obfsKey = t.cfg.Token
 		}
-		
+
 		log.Printf("[%s] Connecting to %s (QUIC + Obfs)...", t.cfg.Name, addr)
-		
-		// 创建 UDP 连接
+
 		udpAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			return fmt.Errorf("failed to resolve addr: %w", err)
 		}
-		
+
 		udpConn, err := net.ListenUDP("udp", nil)
 		if err != nil {
 			return fmt.Errorf("failed to create UDP conn: %w", err)
 		}
-		
-		// 包装为混淆连接
+
 		obfsConn := obfs.NewObfsPacketConn(udpConn, obfsKey)
-		
-		// 使用混淆连接建立 QUIC
+
 		tr := &quic.Transport{Conn: obfsConn}
-		conn, err = tr.Dial(t.ctx, udpAddr, tlsConfig, quicConfig)
+		conn, err = tr.Dial(dialCtx, udpAddr, tlsConfig, quicConfig)
 		if err != nil {
 			udpConn.Close()
 			return fmt.Errorf("failed to connect: %w", err)
 		}
 	} else {
 		log.Printf("[%s] Connecting to %s (QUIC)...", t.cfg.Name, addr)
-		conn, err = quic.DialAddr(t.ctx, addr, tlsConfig, quicConfig)
+		conn, err = quic.DialAddr(dialCtx, addr, tlsConfig, quicConfig)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
 	}
-	
-	t.conn = conn
 
-	// 认证
+	t.mu.Lock()
+	t.conn = conn
+	t.mu.Unlock()
+
+	// Authenticate
 	if err := t.authenticate(); err != nil {
 		conn.CloseWithError(1, "auth failed")
 		return err
 	}
 
+	t.mu.Lock()
 	t.connected = true
+	t.mu.Unlock()
+
 	log.Printf("[%s] Connected and authenticated", t.cfg.Name)
-
-	// 启动心跳
-	go t.heartbeat()
-
 	return nil
 }
 
@@ -112,13 +145,11 @@ func (t *QUICTunnel) authenticate() error {
 		return fmt.Errorf("failed to open auth stream: %w", err)
 	}
 
-	// 发送认证帧
 	if err := protocol.WriteAuthFrame(stream, t.cfg.Token); err != nil {
 		stream.Close()
 		return fmt.Errorf("failed to write auth frame: %w", err)
 	}
 
-	// 读取响应
 	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	success, err := protocol.ReadAuthResponse(stream)
 	if err != nil {
@@ -143,15 +174,62 @@ func (t *QUICTunnel) heartbeat() {
 	ticker := time.NewTicker(time.Duration(interval) * time.Second)
 	defer ticker.Stop()
 
+	failCount := 0
+
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
 		case <-ticker.C:
 			if err := t.sendHeartbeat(); err != nil {
-				log.Printf("[%s] Heartbeat failed: %v", t.cfg.Name, err)
+				failCount++
+				log.Printf("[%s] Heartbeat failed (%d/3): %v", t.cfg.Name, failCount, err)
+				if failCount >= 3 {
+					log.Printf("[%s] Heartbeat failed 3 consecutive times, reconnecting...", t.cfg.Name)
+					t.reconnect()
+					failCount = 0
+				}
+			} else {
+				failCount = 0
 			}
 		}
+	}
+}
+
+// reconnect performs auto-reconnect with exponential backoff.
+// Called from heartbeat goroutine, so no new goroutine is spawned.
+func (t *QUICTunnel) reconnect() {
+	t.mu.Lock()
+	t.connected = false
+	if t.conn != nil {
+		t.conn.CloseWithError(0, "reconnecting")
+	}
+	t.mu.Unlock()
+
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		default:
+		}
+
+		log.Printf("[%s] Reconnecting (backoff: %v)...", t.cfg.Name, backoff)
+		time.Sleep(backoff)
+
+		if err := t.connectInternal(); err != nil {
+			log.Printf("[%s] Reconnect failed: %v", t.cfg.Name, err)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		log.Printf("[%s] Reconnected successfully", t.cfg.Name)
+		return
 	}
 }
 
@@ -171,7 +249,8 @@ func (t *QUICTunnel) sendHeartbeat() error {
 	return protocol.ReadHeartbeatResponse(stream)
 }
 
-// Proxy 代理一个连接到目标
+// Proxy proxies a local connection through the QUIC tunnel to the target.
+// Both directions use idle timeout to prevent hung streams from exhausting QUIC stream capacity.
 func (t *QUICTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uint16) error {
 	t.mu.Lock()
 	if !t.connected {
@@ -180,13 +259,11 @@ func (t *QUICTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uin
 	}
 	t.mu.Unlock()
 
-	// 打开新的 stream
 	stream, err := t.conn.OpenStreamSync(t.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to open stream: %w", err)
 	}
 
-	// 发送目标地址
 	if err := protocol.WriteConnectFrame(stream, targetAddr, targetPort); err != nil {
 		stream.Close()
 		return fmt.Errorf("failed to write connect frame: %w", err)
@@ -194,26 +271,88 @@ func (t *QUICTunnel) Proxy(localConn net.Conn, targetAddr string, targetPort uin
 
 	log.Printf("[%s] Proxying to %s:%d", t.cfg.Name, targetAddr, targetPort)
 
-	// 双向转发（在当前 goroutine 中阻塞执行）
+	const idleTimeout = 60 * time.Second
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// local -> remote
+	// local -> remote (idle timeout on local read)
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, localConn)
-		stream.Close() // 关闭写方向
+		r := &idleTimeoutReader{
+			reader:      localConn,
+			setDeadline: localConn.SetReadDeadline,
+			timeout:     idleTimeout,
+		}
+		io.Copy(stream, r)
+		stream.Close()
 	}()
 
-	// remote -> local
+	// remote -> local (idle timeout on stream read)
 	go func() {
 		defer wg.Done()
-		io.Copy(localConn, stream)
-		localConn.Close() // 关闭写方向
+		r := &idleTimeoutReader{
+			reader:      stream,
+			setDeadline: stream.SetReadDeadline,
+			timeout:     idleTimeout,
+		}
+		io.Copy(localConn, r)
+		localConn.Close()
 	}()
 
 	wg.Wait()
 	return nil
+}
+
+// ForwardDNS 通过 QUIC 隧道转发 DNS 查询（DNS-over-TCP）
+// 服务端视为普通 TCP 代理到 8.8.8.8:53，无需任何修改
+func (t *QUICTunnel) ForwardDNS(query []byte) ([]byte, error) {
+	t.mu.Lock()
+	if !t.connected {
+		t.mu.Unlock()
+		return nil, fmt.Errorf("tunnel not connected")
+	}
+	t.mu.Unlock()
+
+	stream, err := t.conn.OpenStreamSync(t.ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open stream: %w", err)
+	}
+	defer stream.Close()
+
+	stream.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// 发送 CONNECT 帧：目标 8.8.8.8:53
+	if err := protocol.WriteConnectFrame(stream, "8.8.8.8", 53); err != nil {
+		return nil, fmt.Errorf("failed to write connect frame: %w", err)
+	}
+
+	// DNS-over-TCP: 写入 [2-byte 长度][查询数据]
+	lenBuf := make([]byte, 2)
+	lenBuf[0] = byte(len(query) >> 8)
+	lenBuf[1] = byte(len(query))
+	if _, err := stream.Write(lenBuf); err != nil {
+		return nil, fmt.Errorf("failed to write DNS query length: %w", err)
+	}
+	if _, err := stream.Write(query); err != nil {
+		return nil, fmt.Errorf("failed to write DNS query: %w", err)
+	}
+
+	// DNS-over-TCP: 读取 [2-byte 长度][响应数据]
+	if _, err := io.ReadFull(stream, lenBuf); err != nil {
+		return nil, fmt.Errorf("failed to read DNS response length: %w", err)
+	}
+	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+	if respLen == 0 || respLen > 65535 {
+		return nil, fmt.Errorf("invalid DNS response length: %d", respLen)
+	}
+
+	resp := make([]byte, respLen)
+	if _, err := io.ReadFull(stream, resp); err != nil {
+		return nil, fmt.Errorf("failed to read DNS response: %w", err)
+	}
+
+	return resp, nil
 }
 
 func (t *QUICTunnel) Close() {

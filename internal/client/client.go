@@ -7,15 +7,17 @@ import (
 	"sync"
 
 	"github.com/smartlink/slp-client/internal/config"
+	"github.com/smartlink/slp-client/internal/dns"
 	"github.com/smartlink/slp-client/internal/socks5"
 	"github.com/smartlink/slp-client/internal/tunnel"
 )
 
 type Client struct {
-	cfg     *config.Config
-	tunnels []tunnelEntry
-	socks   []*socks5.Server
-	mu      sync.Mutex
+	cfg        *config.Config
+	tunnels    []tunnelEntry
+	socks      []*socks5.Server
+	dnsProxies []*dns.DNSProxy
+	mu         sync.Mutex
 }
 
 type tunnelEntry struct {
@@ -36,10 +38,10 @@ func (c *Client) Start() error {
 		}
 
 		cfg := tcfg // 复制一份
-		
+
 		// 创建隧道
 		t := tunnel.New(&cfg)
-		
+
 		// 连接
 		if err := t.Connect(); err != nil {
 			log.Printf("[%s] Failed to connect: %v", cfg.Name, err)
@@ -52,9 +54,29 @@ func (c *Client) Start() error {
 		}
 		c.tunnels = append(c.tunnels, entry)
 
+		// DNS 代理 + hostname 缓存（配置了 dns_port 时启用）
+		var cache *dns.HostnameCache
+		if cfg.DNSPort > 0 {
+			cache = dns.NewHostnameCache()
+			dnsProxy := dns.New(cfg.DNSPort, t, cache)
+			if err := dnsProxy.Start(); err != nil {
+				log.Printf("[%s] DNS proxy failed: %v", cfg.Name, err)
+				cache = nil // DNS 代理未启动，禁用 redir-host
+			} else {
+				log.Printf("[%s] DNS proxy on :%d", cfg.Name, cfg.DNSPort)
+				c.dnsProxies = append(c.dnsProxies, dnsProxy)
+			}
+		}
+
 		// 创建本地 SOCKS5 服务
 		handler := &proxyHandler{tunnel: t}
 		s := socks5.New(cfg.LocalPort, handler)
+
+		// 启用 redir-host 模式（DNS 缓存存在时）
+		if cache != nil {
+			s.SetResolver(cache)
+		}
+
 		if err := s.Start(); err != nil {
 			log.Printf("[%s] Failed to start SOCKS5: %v", cfg.Name, err)
 			continue
@@ -72,6 +94,9 @@ func (c *Client) Start() error {
 }
 
 func (c *Client) Stop() {
+	for _, p := range c.dnsProxies {
+		p.Stop()
+	}
 	for _, s := range c.socks {
 		s.Stop()
 	}
